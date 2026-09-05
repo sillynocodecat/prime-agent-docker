@@ -1,0 +1,75 @@
+#!/bin/sh
+# Container-owned Prime Agent CLI wrapper (TODO §4).
+#
+# Plain use (a diagnostic `podman exec prime-agent list`) just execs the staged
+# bundle. The host launcher instead sets PRIME_AGENT_CONTAINER_CLIENT=1, and
+# then this wrapper:
+#   1. atomically records a client lease (PID + /proc start time) so the
+#      service controller keeps the container alive while this client runs;
+#   2. when the first argument is exactly the public `shutdown` command, ties a
+#      manual-shutdown marker to that lease so the controller can distinguish an
+#      intentional daemon stop from a crash;
+#   3. checks the controller's stopping gate after the lease exists and, if the
+#      gate is set, removes the lease and exits 200 so the host can retry;
+#   4. clears the marker variable and execs the CLI unchanged. exec keeps the
+#      PID, so the lease stays tied to the real Prime Agent process; daemon and
+#      worker subprocesses launch the bundle directly and never come back here.
+set -eu
+
+bundle=/opt/prime-agent/packages/coding-agent/dist/bundle/cli.js
+run_dir=/run/prime-agent-container
+node=/usr/local/bin/node
+export PRIME_AGENT_LAUNCHER_PATH=/usr/local/bin/prime-agent
+
+if [ "${PRIME_AGENT_CONTAINER_CLIENT:-}" != "1" ]; then
+  exec "$node" "$bundle" "$@"
+fi
+unset PRIME_AGENT_CONTAINER_CLIENT
+# The host launcher tags this client so it can hang up exactly this process
+# when the terminal disappears (an exec'd TUI outlives a detached engine client).
+token=${PRIME_AGENT_CONTAINER_CLIENT_TOKEN:-}
+unset PRIME_AGENT_CONTAINER_CLIENT_TOKEN
+
+clients="$run_dir/clients"
+if [ ! -d "$clients" ]; then
+  echo "prime-agent: the container service is not running (no $clients); start the container through the host launcher" >&2
+  exit 70
+fi
+
+pid=$$
+# /proc/<pid>/stat: everything after the last ')' starts at field 3, so the
+# process start time (field 22) is the 20th token of that remainder.
+start=$(sed 's/^.*) //' "/proc/$pid/stat" | cut -d' ' -f20)
+case "$start" in
+  ''|*[!0-9]*) echo "prime-agent: cannot read process start time for pid $pid" >&2; exit 70 ;;
+esac
+
+umask 077
+tmp=$(mktemp -d "$clients/.new-$pid-XXXXXX")
+printf '%s\n' "$start" >"$tmp/starttime"
+[ -z "$token" ] || printf '%s\n' "$token" >"$tmp/token"
+lease="$clients/$pid"
+if ! mv -T "$tmp" "$lease" 2>/dev/null; then
+  # A previous process with this PID died without the controller pruning its
+  # lease yet; a different start time proves it is not ours.
+  if [ -d "$lease" ] && [ "$(cat "$lease/starttime" 2>/dev/null || true)" != "$start" ]; then
+    rm -rf "$lease"
+    mv -T "$tmp" "$lease"
+  else
+    rm -rf "$tmp"
+    echo "prime-agent: could not record client lease $lease" >&2
+    exit 70
+  fi
+fi
+
+if [ "${1:-}" = "shutdown" ]; then
+  printf '%s %s\n' "$pid" "$start" >"$run_dir/manual-shutdown"
+fi
+
+if [ -e "$run_dir/stopping" ]; then
+  rm -rf "$lease"
+  echo "prime-agent: the container service is stopping; retry" >&2
+  exit 200
+fi
+
+exec "$node" "$bundle" "$@"

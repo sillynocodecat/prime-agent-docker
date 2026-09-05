@@ -1,0 +1,16 @@
+# Allow-list: only the build inputs reach the build context. Everything else
+# (.git, the git-ignored temp/ reference checkouts, editor files, env files,
+# credentials, logs, build output, documentation) stays on the host.
+*
+!Dockerfile
+!prime-agent-container.patch
+!build/
+!rootfs/
+!THIRD_PARTY_NOTICES.md
+# Never ship residue from inside the allowed directories either.
+build/**/*.log
+**/.DS_Store
+**/*.swp
+**/*~
+**/.env
+**/.env.*

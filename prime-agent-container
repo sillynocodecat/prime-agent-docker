@@ -1,0 +1,679 @@
+#!/bin/sh
+# prime-agent-container — portable host launcher for the Prime Agent container.
+#
+# Keeps the plain `prime-agent [args...]` UX: it mounts the current directory as
+# /work and $HOME/prime-agent/data as /data in one managed service container
+# (fixed name `prime-agent`), starts that container when needed, waits for its
+# lifecycle service to be ready, and then runs the in-container CLI client with
+# every argument forwarded unchanged. The service inside the container decides
+# on its own when background work is quiescent and exits 0; the next launcher
+# removes that stopped container and releases the host-only workspace fence.
+#
+# POSIX sh only. Host dependencies: the selected container engine and standard
+# POSIX utilities (mkdir, mv, rm, ls, cksum, sed, cut, wc, cat, sleep, tty).
+# Install as ~/.local/bin/prime-agent (copy or symlink) or wrap it with a
+# trivial shell alias. Environment knobs (all optional):
+#   PRIME_AGENT_ENGINE          engine executable name or path (default: podman, then docker)
+#   PRIME_AGENT_IMAGE           image reference (default ghcr.io/sillynocodecat/prime-agent-docker:latest)
+#   PRIME_AGENT_ENV_FILE        env-file applied only when a container is created
+#   PRIME_AGENT_TZ              container timezone (else host TZ, /etc/localtime, /etc/timezone, Etc/UTC)
+#   PRIME_AGENT_NO_OAUTH_PORTS  exactly `1` to publish no OAuth callback ports
+#   PRIME_AGENT_ENGINE_KIND     `podman` or `docker` when the engine's basename does not say
+#   PRIME_AGENT_CONTAINER_DEBUG append a trace of client start/trap/hang-up events to this file
+#
+# Exit status: the Prime Agent CLI's own status when the client ran; otherwise
+#   64 usage/validation error, 69 engine unavailable, 70 launcher/engine failure
+#   (state retained), 73 refused (workspace/fence/data rule), 75 temporary
+#   (lock or stopping gate busy; retry).
+set -u
+
+LAUNCHER_VERSION=1
+FENCE_VERSION=1
+CONTAINER_NAME=prime-agent
+DEFAULT_IMAGE=ghcr.io/sillynocodecat/prime-agent-docker:latest
+LABEL_PREFIX=io.github.sillynocodecat.prime-agent-docker
+RUN_DIR=/run/prime-agent-container
+# Timeouts in seconds; the PRIME_AGENT_CONTAINER_TEST_TIMEOUTS override
+# ("ready lock fence gate") exists only for the fake-engine self-test.
+READY_TIMEOUT=30; LOCK_TIMEOUT=30; FENCE_WAIT=10; GATE_WAIT=30
+case "${PRIME_AGENT_CONTAINER_TEST_TIMEOUTS:-}" in
+  "") ;;
+  *) set -- "$@"; _t=$PRIME_AGENT_CONTAINER_TEST_TIMEOUTS
+     READY_TIMEOUT=${_t%% *}; _t=${_t#* }; LOCK_TIMEOUT=${_t%% *}; _t=${_t#* }; FENCE_WAIT=${_t%% *}; GATE_WAIT=${_t#* } ;;
+esac
+EX_USAGE=64; EX_UNAVAILABLE=69; EX_FAILURE=70; EX_REFUSED=73; EX_TEMPFAIL=75
+LOCK=; LOCK_HELD=
+NL='
+'
+
+# ---------------------------------------------------------------------------
+# messages
+# ---------------------------------------------------------------------------
+msg()  { printf 'prime-agent-container: %s\n' "$*" >&2; }
+dbg()  { [ -z "${PRIME_AGENT_CONTAINER_DEBUG:-}" ] || printf '%s pid=%s %s\n' "$(date +%T)" "$$" "$*" >>"$PRIME_AGENT_CONTAINER_DEBUG" 2>/dev/null; }
+release_lock() { if [ -n "$LOCK_HELD" ]; then rm -rf -- "$LOCK" 2>/dev/null; LOCK_HELD=; fi; }
+die()  { code=$1; shift; msg "$*"; release_lock; exit "$code"; }
+has_nl() { case "$1" in *"$NL"*) return 0 ;; esac; return 1; }
+
+# ---------------------------------------------------------------------------
+# small helpers (POSIX only)
+# ---------------------------------------------------------------------------
+canon_dir() { (cd -P -- "$1" 2>/dev/null && pwd -P); }
+dir_mode_owner_ok() { # $1 = dir: not a symlink, a directory, owned by us, mode drwx------
+  [ ! -L "$1" ] && [ -d "$1" ] && [ -O "$1" ] || return 1
+  case "$(ls -ld -- "$1" 2>/dev/null | cut -c1-10)" in drwx------) return 0 ;; esac
+  return 1
+}
+ensure_private_dir() { # create if missing, then validate
+  if [ ! -e "$1" ] && [ ! -L "$1" ]; then mkdir -m 0700 -- "$1" 2>/dev/null || die $EX_FAILURE "cannot create $1"; fi
+  dir_mode_owner_ok "$1" || die $EX_REFUSED "$1 must be a mode-0700 directory owned by you (not a symlink)"
+}
+read1() { # $1 = file → prints its single line; fails on symlink/type/owner/multi-line
+  [ ! -L "$1" ] && [ -f "$1" ] && [ -O "$1" ] || return 1
+  [ "$(wc -l <"$1" | tr -d ' ')" = 1 ] || return 1
+  IFS= read -r _line <"$1" || return 1
+  printf '%s\n' "$_line"
+}
+write1() { # $1 = file, $2 = value (mode 0600)
+  ( umask 077; printf '%s\n' "$2" >"$1" ) || die $EX_FAILURE "cannot write $1"
+}
+proc_start() { # $1 = pid → /proc start time or empty
+  [ -r "/proc/$1/stat" ] || return 1
+  sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20
+}
+boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown-boot; }
+random_token() {
+  tok=$( (cat /proc/sys/kernel/random/uuid 2>/dev/null) | tr -d '\n-')
+  [ -n "$tok" ] || tok="$(date +%s 2>/dev/null)$$"
+  printf '%s\n' "$tok"
+}
+is_tty() { [ -t "$1" ]; }
+
+# ---------------------------------------------------------------------------
+# 1. workspace and host state directories
+# ---------------------------------------------------------------------------
+WS=$(canon_dir .) || die $EX_USAGE "the current directory cannot be resolved (deleted or unreadable?)"
+[ -n "$WS" ] || die $EX_USAGE "the current directory cannot be resolved"
+[ "$WS" != "/" ] || die $EX_USAGE "refusing to use / as the workspace"
+[ -r "$WS" ] && [ -x "$WS" ] || die $EX_USAGE "workspace $WS is not readable"
+has_nl "$WS" && die $EX_USAGE "workspace path contains a newline; it cannot be recorded safely"
+case "$WS" in *:*) die $EX_USAGE "workspace path contains ':' which the engine bind syntax cannot represent: $WS" ;; esac
+
+[ -n "${HOME:-}" ] || die $EX_USAGE "HOME is empty"
+case "$HOME" in /*) ;; *) die $EX_USAGE "HOME must be an absolute path: $HOME" ;; esac
+[ "$HOME" != "/" ] || die $EX_USAGE "HOME must not be /"
+has_nl "$HOME" && die $EX_USAGE "HOME contains a newline"
+case "$HOME" in *:*) die $EX_USAGE "HOME contains ':' which the engine bind syntax cannot represent" ;; esac
+HOME_CANON=$(canon_dir "$HOME") || die $EX_USAGE "HOME does not exist: $HOME"
+STATE_ROOT="$HOME_CANON/prime-agent"
+[ -e "$STATE_ROOT" ] || [ -L "$STATE_ROOT" ] || mkdir -m 0700 -- "$STATE_ROOT" 2>/dev/null || die $EX_FAILURE "cannot create $STATE_ROOT"
+dir_mode_owner_ok "$STATE_ROOT" || die $EX_REFUSED "$STATE_ROOT must be a mode-0700 directory owned by you (not a symlink)"
+ensure_private_dir "$STATE_ROOT/data"
+ensure_private_dir "$STATE_ROOT/control"
+DATA=$(canon_dir "$STATE_ROOT/data") || die $EX_FAILURE "cannot resolve $STATE_ROOT/data"
+CONTROL=$(canon_dir "$STATE_ROOT/control") || die $EX_FAILURE "cannot resolve $STATE_ROOT/control"
+for d in "$DATA" "$CONTROL"; do
+  has_nl "$d" && die $EX_USAGE "state path contains a newline: $d"
+  case "$d" in *:*) die $EX_USAGE "state path contains ':': $d" ;; esac
+  [ "$d" = "$WS" ] && die $EX_REFUSED "the workspace is the state directory itself: $d"
+  case "$WS/" in "$d"/*) die $EX_REFUSED "workspace $WS lies inside the state directory $d" ;; esac
+  case "$d/" in "$WS"/*) die $EX_REFUSED "state directory $d lies inside the workspace $WS; /data would also be visible under /work" ;; esac
+done
+FENCE="$CONTROL/workspace"
+TOMB="$CONTROL/clean-release"
+LOCK="$CONTROL/launcher.lock"
+
+# ---------------------------------------------------------------------------
+# 2. engine selection
+# ---------------------------------------------------------------------------
+for v in DOCKER_HOST DOCKER_CONTEXT CONTAINER_HOST CONTAINER_CONNECTION PODMAN_HOST; do
+  eval "val=\${$v:-}"
+  [ -z "$val" ] || die $EX_USAGE "$v is set; remote or alternate engine contexts/connections are not supported (bind mounts must be local)"
+done
+ENGINE=${PRIME_AGENT_ENGINE:-}
+if [ -n "$ENGINE" ]; then
+  has_nl "$ENGINE" && die $EX_USAGE "PRIME_AGENT_ENGINE contains a newline"
+  case "$ENGINE" in
+    */*) [ -x "$ENGINE" ] && [ -f "$ENGINE" ] || die $EX_UNAVAILABLE "PRIME_AGENT_ENGINE is not an executable file: $ENGINE" ;;
+    *) command -v -- "$ENGINE" >/dev/null 2>&1 || die $EX_UNAVAILABLE "PRIME_AGENT_ENGINE is not on PATH: $ENGINE" ;;
+  esac
+elif command -v podman >/dev/null 2>&1; then ENGINE=podman
+elif command -v docker >/dev/null 2>&1; then ENGINE=docker
+else die $EX_UNAVAILABLE "neither podman nor docker is on PATH (set PRIME_AGENT_ENGINE to choose one)"
+fi
+ENGINE_KIND=${PRIME_AGENT_ENGINE_KIND:-}
+case "$ENGINE_KIND" in
+  podman|docker) ;;
+  "") case "$(basename -- "$ENGINE")" in *docker*) ENGINE_KIND=docker ;; *) ENGINE_KIND=podman ;; esac ;;
+  *) die $EX_USAGE "PRIME_AGENT_ENGINE_KIND must be podman or docker" ;;
+esac
+if [ "$ENGINE_KIND" = docker ]; then NNP=no-new-privileges=true; else NNP=no-new-privileges; fi
+eng() { "$ENGINE" "$@"; }
+
+# ---------------------------------------------------------------------------
+# 3. argument screen (before the first standalone --)
+# ---------------------------------------------------------------------------
+prev=
+for a in "$@"; do
+  [ "$a" = "--" ] && break
+  case "$a" in
+    --mode=daemon) die $EX_USAGE "--mode daemon is reserved for the managed service inside the container" ;;
+    --daemon-socket|--daemon-socket=*|--socket|--socket=*) die $EX_USAGE "$a is not allowed: the managed container owns the default daemon socket" ;;
+  esac
+  [ "$prev" = "--mode" ] && [ "$a" = "daemon" ] && die $EX_USAGE "--mode daemon is reserved for the managed service inside the container"
+  prev=$a
+done
+
+# ---------------------------------------------------------------------------
+# 4. image, env-file, timezone, OAuth mode
+# ---------------------------------------------------------------------------
+IMAGE=${PRIME_AGENT_IMAGE-$DEFAULT_IMAGE}
+[ -n "$IMAGE" ] || die $EX_USAGE "PRIME_AGENT_IMAGE is empty"
+has_nl "$IMAGE" && die $EX_USAGE "PRIME_AGENT_IMAGE contains a newline"
+case "$IMAGE" in -*) die $EX_USAGE "PRIME_AGENT_IMAGE must not start with '-'" ;; esac
+
+ENV_FILE=
+ENV_CKSUM=
+if [ -n "${PRIME_AGENT_ENV_FILE:-}" ]; then
+  f=$PRIME_AGENT_ENV_FILE
+  has_nl "$f" && die $EX_USAGE "PRIME_AGENT_ENV_FILE path contains a newline"
+  [ -f "$f" ] && [ -r "$f" ] || die $EX_USAGE "PRIME_AGENT_ENV_FILE is not a readable regular file: $f"
+  fdir=$(canon_dir "$(dirname -- "$f")") || die $EX_USAGE "cannot resolve PRIME_AGENT_ENV_FILE directory"
+  ENV_FILE="$fdir/$(basename -- "$f")"
+  [ -f "$ENV_FILE" ] || die $EX_USAGE "cannot canonicalize PRIME_AGENT_ENV_FILE"
+  case "$ENV_FILE" in *:*) die $EX_USAGE "PRIME_AGENT_ENV_FILE path contains ':'" ;; esac
+  # Keys only; values are never read into variables, printed, or evaluated.
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    key=${line%%=*}
+    key=$(printf '%s' "$key" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    case "$key" in
+      NODE_OPTIONS|NODE_PATH|LD_PRELOAD|LD_LIBRARY_PATH)
+        die $EX_USAGE "env-file key $key is rejected: it could inject code into the container service" ;;
+      PRIME_AGENT_INTERNAL_*|PRIME_AGENT_KERNEL_PYTHON|PRIME_AGENT_SESSION_DIR|PRIME_AGENT_CODING_AGENT_SESSION_DIR|PRIME_AGENT_CONTAINER_CLIENT)
+        die $EX_USAGE "env-file key $key is rejected: it would impersonate a worker/client or move state outside /data" ;;
+      DOCKER_HOST|DOCKER_CONTEXT|DOCKER_CONFIG|DOCKER_TLS_VERIFY|DOCKER_CERT_PATH|CONTAINER_HOST|CONTAINER_CONNECTION|CONTAINER_SSHKEY|PODMAN_HOST|PODMAN_CONNECTIONS_CONF|CONTAINERS_CONF|CONTAINERS_STORAGE_CONF|REGISTRIES_CONFIG_PATH)
+        die $EX_USAGE "env-file key $key is rejected: the bundled podman-remote must not be configured implicitly" ;;
+    esac
+  done <"$ENV_FILE"
+  ENV_CKSUM=$(cksum <"$ENV_FILE" | cut -d' ' -f1,2)
+fi
+
+tz_valid() { # IANA-ish or POSIX TZ string: printable, no newline, no traversal, not absolute
+  [ -n "$1" ] || return 1
+  has_nl "$1" && return 1
+  case "$1" in /*|*..*|*[!A-Za-z0-9_+,./:-]*) return 1 ;; esac
+  return 0
+}
+TZ_SEL=
+if [ -n "${PRIME_AGENT_TZ:-}" ]; then
+  tz_valid "$PRIME_AGENT_TZ" || die $EX_USAGE "PRIME_AGENT_TZ is not a valid timezone name: $PRIME_AGENT_TZ"
+  TZ_SEL=$PRIME_AGENT_TZ
+elif [ -n "${TZ:-}" ]; then
+  t=${TZ#:}
+  tz_valid "$t" || die $EX_USAGE "host TZ is not a usable timezone name: $TZ"
+  TZ_SEL=$t
+elif [ -L /etc/localtime ]; then
+  target=$(readlink /etc/localtime 2>/dev/null || ls -ld /etc/localtime 2>/dev/null | sed 's/^.* -> //')
+  case "$target" in /*) abs=$target ;; *) abs="/etc/$target" ;; esac
+  tdir=$(canon_dir "$(dirname -- "$abs")") && abs="$tdir/$(basename -- "$abs")"
+  case "$abs" in
+    /usr/share/zoneinfo/*) t=${abs#/usr/share/zoneinfo/}; t=${t#posix/}; tz_valid "$t" && TZ_SEL=$t ;;
+  esac
+fi
+if [ -z "$TZ_SEL" ] && [ -f /etc/timezone ] && [ "$(wc -l </etc/timezone | tr -d ' ')" = 1 ]; then
+  IFS= read -r t </etc/timezone
+  tz_valid "$t" && TZ_SEL=$t
+fi
+[ -n "$TZ_SEL" ] || TZ_SEL=Etc/UTC
+
+case "${PRIME_AGENT_NO_OAUTH_PORTS:-}" in
+  "") OAUTH=ports ;;
+  1) OAUTH=none ;;
+  *) die $EX_USAGE "PRIME_AGENT_NO_OAUTH_PORTS must be exactly 1 or unset (got '${PRIME_AGENT_NO_OAUTH_PORTS}')" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# 5. launcher lock: control/launcher.lock (atomic mkdir) with boot id, pid,
+#    /proc start time; bounded wait for a live owner; reclaim only proven stale.
+# ---------------------------------------------------------------------------
+lock_owner_alive() { # reads $LOCK/owner → 0 if owner proven live, 1 if stale/unknown
+  o=$(read1 "$LOCK/owner" 2>/dev/null) || return 1
+  b=${o%% *}; rest=${o#* }; p=${rest%% *}; st=${rest#* }
+  [ "$b" = "$(boot_id)" ] || return 1
+  [ "$(proc_start "$p" 2>/dev/null)" = "$st" ] || return 1
+  return 0
+}
+acquire_lock() {
+  waited=0; missing=0
+  while :; do
+    # mkdir is the atomic claim (POSIX mv has no rename-only mode for directories).
+    if mkdir -- "$LOCK" 2>/dev/null; then
+      LOCK_HELD=1
+      write1 "$LOCK/owner" "$(boot_id) $$ $(proc_start $$)"
+      return 0
+    fi
+    if [ ! -e "$LOCK/owner" ]; then
+      # A live claimant writes its owner file microseconds after mkdir; only a
+      # directory that stays empty across several polls is proven abandoned.
+      missing=$((missing+1))
+      if [ "$missing" -lt 3 ]; then sleep 1; waited=$((waited+1)); continue; fi
+    elif lock_owner_alive; then
+      [ "$waited" -lt "$LOCK_TIMEOUT" ] || die $EX_TEMPFAIL "another launcher holds $LOCK (owner alive); retry"
+      sleep 1; waited=$((waited+1)); continue
+    fi
+    # Stale: renaming to a unique name is atomic, so only one reclaimer wins.
+    if mv -- "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then rm -rf -- "$LOCK.stale.$$"; fi
+    missing=0
+  done
+}
+acquire_lock
+# leftover private claim directories from a killed launcher are harmless; drop them under the lock
+for d in "$CONTROL"/claim.*; do [ -d "$d" ] && rm -rf -- "$d"; done
+
+# ---------------------------------------------------------------------------
+# 6. container and image inspection
+# ---------------------------------------------------------------------------
+strip_sha() { printf '%s\n' "${1#sha256:}"; }
+ERRF=${TMPDIR:-/tmp}/prime-agent-container.$$.err
+ctr_inspect() { # sets CTR_* ; returns 0 exists, 1 absent, dies on engine error
+  CTR_STATUS=; CTR_EXIT=; CTR_STARTED=; CTR_IMAGE=; CTR_MANAGED=; CTR_WS=; CTR_IMGREF=; CTR_CLAIM=; CTR_ID=
+  fmt='{{.State.Status}}
+{{.State.ExitCode}}
+{{.State.StartedAt}}
+{{.Image}}
+{{index .Config.Labels "'$LABEL_PREFIX'.managed"}}
+{{index .Config.Labels "'$LABEL_PREFIX'.workspace"}}
+{{index .Config.Labels "'$LABEL_PREFIX'.image"}}
+{{index .Config.Labels "'$LABEL_PREFIX'.claim"}}
+{{.Id}}'
+  out=$(eng inspect --type container --format "$fmt" "$CONTAINER_NAME" 2>"$ERRF")
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    if grep -qi 'no such' "$ERRF"; then rm -f "$ERRF"; return 1; fi
+    msg "engine error while inspecting container $CONTAINER_NAME:"; cat "$ERRF" >&2; rm -f "$ERRF"
+    die $EX_UNAVAILABLE "is the $ENGINE_KIND engine running?"
+  fi
+  rm -f "$ERRF"
+  { IFS= read -r CTR_STATUS; IFS= read -r CTR_EXIT; IFS= read -r CTR_STARTED; IFS= read -r CTR_IMAGE
+    IFS= read -r CTR_MANAGED; IFS= read -r CTR_WS; IFS= read -r CTR_IMGREF; IFS= read -r CTR_CLAIM; IFS= read -r CTR_ID; } <<EOF
+$out
+EOF
+  CTR_IMAGE=$(strip_sha "$CTR_IMAGE"); CTR_ID=$(strip_sha "$CTR_ID")
+  return 0
+}
+ctr_never_started() { case "$CTR_STARTED" in 0001-01-01*) return 0 ;; esac; return 1; }
+
+img_inspect() { # $1 = reference or id → sets IMG_ID IMG_SCHEMA IMG_VERSION IMG_DIGEST IMG_ENV; 1 if absent
+  IMG_ID=; IMG_SCHEMA=; IMG_VERSION=; IMG_DIGEST=; IMG_ENV=
+  fmt='{{.Id}}
+{{index .Config.Labels "'$LABEL_PREFIX'.runtime-schema"}}
+{{index .Config.Labels "org.opencontainers.image.version"}}
+{{range .RepoDigests}}{{.}} {{end}}
+{{range .Config.Env}}{{.}}
+{{end}}'
+  out=$(eng image inspect --format "$fmt" "$1" 2>"$ERRF")
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    if grep -qi -e 'no such' -e 'not known' -e 'not found' "$ERRF"; then rm -f "$ERRF"; return 1; fi
+    msg "engine error while inspecting image $1:"; cat "$ERRF" >&2; rm -f "$ERRF"
+    die $EX_UNAVAILABLE "is the $ENGINE_KIND engine running?"
+  fi
+  rm -f "$ERRF"
+  { IFS= read -r IMG_ID; IFS= read -r IMG_SCHEMA; IFS= read -r IMG_VERSION; IFS= read -r digests
+    IMG_ENV=$(cat); } <<EOF
+$out
+EOF
+  IMG_ID=$(strip_sha "$IMG_ID")
+  # prefer the digest whose repository matches the requested reference
+  repo=${1%%@*}; repo=${repo%:*}
+  for dgst in $digests; do
+    case "$dgst" in "$repo@sha256:"*) IMG_DIGEST=$dgst; break ;; esac
+  done
+  [ -n "$IMG_DIGEST" ] || for dgst in $digests; do IMG_DIGEST=$dgst; break; done
+  return 0
+}
+require_image_identity() {
+  [ "$IMG_SCHEMA" = 1 ] || die $EX_REFUSED "image $1 lacks the managed runtime label $LABEL_PREFIX.runtime-schema=1 (got '${IMG_SCHEMA}'); it is not a prime-agent-docker image"
+  [ -n "$IMG_VERSION" ] || die $EX_REFUSED "image $1 has no org.opencontainers.image.version label"
+  case "$IMG_ID" in *[!0-9a-f]*|"") die $EX_REFUSED "image $1 has an unexpected id '${IMG_ID}'" ;; esac
+}
+# Environment the launcher always re-asserts after any env-file: taken from the
+# image itself so the launcher never hardcodes runtime paths.
+PINNED_KEYS='PATH HOME LANG LC_ALL TMPDIR TMP TEMP PRIME_AGENT_CODING_AGENT_DIR PRIME_AGENT_KERNEL_VENV UV_PYTHON_INSTALL_DIR PRIME_AGENT_CONTAINER_CONFIG_DIR PRIME_AGENT_BUILD_ID PRIME_AGENT_LAUNCHER_PATH PI_OAUTH_CALLBACK_HOST PI_MCP_OAUTH_CALLBACK_PORT PI_SKIP_VERSION_CHECK'
+image_env_value() { # $1 = key → value from IMG_ENV (exactly one line)
+  printf '%s\n' "$IMG_ENV" | sed -n "s/^$1=//p" | head -n 1
+}
+
+# ---------------------------------------------------------------------------
+# 7. fence (control/workspace) and tombstone (control/clean-release)
+# ---------------------------------------------------------------------------
+FENCE_KEYS='version token workspace engine image image-id image-version image-digest tz oauth env-file env-cksum release-token'
+fence_read() { # $1 = dir → sets F_* ; 0 ok, 1 absent, dies on malformed
+  F_VERSION=; F_TOKEN=; F_WS=; F_ENGINE=; F_IMAGE=; F_IMAGE_ID=; F_IMAGE_VERSION=; F_IMAGE_DIGEST=; F_TZ=; F_OAUTH=; F_ENV_FILE=; F_ENV_CKSUM=; F_RELEASE=
+  [ -e "$1" ] || [ -L "$1" ] || return 1
+  dir_mode_owner_ok "$1" || die $EX_REFUSED "$1 is not a private directory owned by you; refusing to trust it"
+  waited=0
+  while [ ! -f "$1/complete" ]; do
+    [ "$waited" -lt "$FENCE_WAIT" ] || die $EX_REFUSED "$1 is incomplete (no 'complete' marker) after ${FENCE_WAIT}s; a previous launcher did not finish its claim. Inspect it and remove it by hand only if no managed container exists"
+    sleep 1; waited=$((waited+1))
+  done
+  for k in $FENCE_KEYS; do
+    if [ -e "$1/$k" ]; then v=$(read1 "$1/$k") || die $EX_REFUSED "$1/$k is malformed (must be one line, a regular file owned by you)"; else v=; fi
+    case "$k" in
+      version) F_VERSION=$v ;; token) F_TOKEN=$v ;; workspace) F_WS=$v ;; engine) F_ENGINE=$v ;;
+      image) F_IMAGE=$v ;; image-id) F_IMAGE_ID=$v ;; image-version) F_IMAGE_VERSION=$v ;; image-digest) F_IMAGE_DIGEST=$v ;;
+      tz) F_TZ=$v ;; oauth) F_OAUTH=$v ;; env-file) F_ENV_FILE=$v ;; env-cksum) F_ENV_CKSUM=$v ;; release-token) F_RELEASE=$v ;;
+    esac
+  done
+  [ "$F_VERSION" = "$FENCE_VERSION" ] || die $EX_REFUSED "$1 has fence version '${F_VERSION}', this launcher understands $FENCE_VERSION"
+  [ -n "$F_TOKEN" ] && [ -n "$F_WS" ] && [ -n "$F_ENGINE" ] && [ -n "$F_IMAGE" ] && [ -n "$F_IMAGE_ID" ] || die $EX_REFUSED "$1 is missing required records"
+  return 0
+}
+fence_write_new() { # writes a complete fence atomically: build in control/claim.<token>, rename to workspace
+  CLAIM_TOKEN=$(random_token)
+  tmp="$CONTROL/claim.$CLAIM_TOKEN"
+  mkdir -m 0700 -- "$tmp" || die $EX_FAILURE "cannot create claim directory"
+  write1 "$tmp/version" "$FENCE_VERSION"
+  write1 "$tmp/token" "$CLAIM_TOKEN"
+  write1 "$tmp/workspace" "$WS"
+  write1 "$tmp/engine" "$ENGINE_KIND"
+  write1 "$tmp/image" "$IMAGE"
+  write1 "$tmp/image-id" "$IMG_ID"
+  write1 "$tmp/image-version" "$IMG_VERSION"
+  write1 "$tmp/image-digest" "$IMG_DIGEST"
+  write1 "$tmp/tz" "$TZ_SEL"
+  write1 "$tmp/oauth" "$OAUTH"
+  [ -z "$ENV_FILE" ] || { write1 "$tmp/env-file" "$ENV_FILE"; write1 "$tmp/env-cksum" "$ENV_CKSUM"; }
+  [ -z "$1" ] || write1 "$tmp/release-token" "$1"
+  write1 "$tmp/complete" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo complete)"
+  # mv onto a non-existent name is an atomic rename; guard against a directory
+  # appearing concurrently (mv would move the claim *into* it) and verify.
+  if [ -e "$FENCE" ] || [ -L "$FENCE" ] || ! mv -- "$tmp" "$FENCE" 2>/dev/null || [ "$(read1 "$FENCE/token" 2>/dev/null)" != "$CLAIM_TOKEN" ]; then
+    rm -rf -- "$tmp" "$FENCE/claim.$CLAIM_TOKEN"
+    die $EX_REFUSED "a workspace fence appeared concurrently at $FENCE; retry"
+  fi
+}
+fence_rollback() { # remove exactly the fence carrying $CLAIM_TOKEN
+  [ -n "${CLAIM_TOKEN:-}" ] || return 0
+  t=$(read1 "$FENCE/token" 2>/dev/null) || return 0
+  [ "$t" = "$CLAIM_TOKEN" ] || return 0
+  mv -- "$FENCE" "$CONTROL/claim.rollback.$$" 2>/dev/null && rm -rf -- "$CONTROL/claim.rollback.$$"
+}
+tomb_read() { # sets T_* ; 0 present+complete, 1 absent; dies on malformed
+  T_TOKEN=; T_WS=; T_ENGINE=; T_CONTAINER=
+  [ -e "$TOMB" ] || [ -L "$TOMB" ] || return 1
+  dir_mode_owner_ok "$TOMB" || die $EX_REFUSED "$TOMB is not a private directory owned by you"
+  [ -f "$TOMB/complete" ] || die $EX_REFUSED "$TOMB is incomplete; inspect it by hand"
+  T_TOKEN=$(read1 "$TOMB/token") && T_WS=$(read1 "$TOMB/workspace") && T_ENGINE=$(read1 "$TOMB/engine") && T_CONTAINER=$(read1 "$TOMB/container") || die $EX_REFUSED "$TOMB is malformed"
+  return 0
+}
+data_empty() { [ -z "$(ls -A -- "$DATA" 2>/dev/null)" ]; }
+
+# ---------------------------------------------------------------------------
+# 8. engine actions
+# ---------------------------------------------------------------------------
+engine_create() { # $1 image id, $2 tz, $3 oauth, $4 env-file (may be empty), $5 claim token, $6 requested image
+  set -- "$1" "$2" "$3" "$4" "$5" "$6"
+  img_inspect "$1" || die $EX_FAILURE "image $1 vanished before the container could be created"
+  # Build the argument list in "$@" so every value stays one argument.
+  set -- "$1" "$2" "$3" "$4" "$5" "$6" \
+    run -d --name "$CONTAINER_NAME" --init --restart=no --stop-timeout 30 --security-opt "$NNP" \
+    --tmpfs "$RUN_DIR:rw,mode=0700,nosuid,nodev" --tmpfs /tmp:rw,mode=1777,nosuid,nodev \
+    -v "$WS:/work:Z" -v "$DATA:/data:Z" -w /work \
+    --label "$LABEL_PREFIX.managed=true" --label "$LABEL_PREFIX.workspace=$WS" \
+    --label "$LABEL_PREFIX.image=$6" --label "$LABEL_PREFIX.claim=$5" \
+    --label "$LABEL_PREFIX.tz=$2" --label "$LABEL_PREFIX.oauth=$3"
+  if [ "$3" = ports ]; then
+    set -- "$@" -p 127.0.0.1:1455:1455 -p 127.0.0.1:53692:53692 -p 127.0.0.1:53700-53709:53700-53709
+  fi
+  [ -z "$4" ] || set -- "$@" --env-file "$4"
+  for k in $PINNED_KEYS; do
+    v=$(image_env_value "$k")
+    [ -n "$v" ] && set -- "$@" -e "$k=$v"
+  done
+  set -- "$@" -e "TZ=$2" -e PRIME_AGENT_CONTAINER_CLIENT= "$1"
+  imgid=$1; shift 6
+  if [ -n "${PRIME_AGENT_CONTAINER_TRACE:-}" ]; then printf 'engine argv:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; fi >&2
+  eng "$@" >/dev/null
+}
+wait_ready() { # 0 ready, 1 container left running state, 2 timeout
+  waited=0
+  while [ "$waited" -lt "$READY_TIMEOUT" ]; do
+    if eng exec "$CONTAINER_NAME" test -f "$RUN_DIR/ready" >/dev/null 2>&1; then return 0; fi
+    ctr_inspect || return 1
+    [ "$CTR_STATUS" = running ] || return 1
+    sleep 1; waited=$((waited+1))
+  done
+  return 2
+}
+show_container_diagnostics() {
+  ctr_inspect && msg "container $CONTAINER_NAME: status=$CTR_STATUS exit=$CTR_EXIT started=$CTR_STARTED"
+  msg "last log lines:"; eng logs --tail 20 "$CONTAINER_NAME" 2>&1 | sed 's/^/  /' >&2
+}
+tomb_write_from_fence() { # transition complete fence → clean-release tombstone (atomic rename)
+  write1 "$FENCE/container" "$CTR_ID"
+  write1 "$FENCE/exit-code" "$CTR_EXIT"
+  if [ -e "$TOMB" ] || [ -L "$TOMB" ]; then mv -- "$TOMB" "$TOMB.old.$$" && rm -rf -- "$TOMB.old.$$"; fi
+  [ ! -e "$TOMB" ] && mv -- "$FENCE" "$TOMB" || die $EX_FAILURE "cannot record the clean release"
+}
+
+# ---------------------------------------------------------------------------
+# 9. state machine (runs under the lock)
+# ---------------------------------------------------------------------------
+recovery_hint() {
+  msg "  inspect:  $ENGINE inspect $CONTAINER_NAME | less"
+  msg "  logs:     $ENGINE logs $CONTAINER_NAME"
+  msg "  fence:    $FENCE"
+  msg "  recover:  cd '$1' && prime-agent   (same directory and engine only)"
+}
+ensure_container() { # leaves an owned, running, ready container for $WS; dies otherwise
+  fence_present=; fence_read "$FENCE" && fence_present=1
+  if ctr_inspect; then
+    [ "$CTR_MANAGED" = true ] || die $EX_REFUSED "a container named $CONTAINER_NAME exists but is not managed by this launcher (no $LABEL_PREFIX.managed=true label); remove or rename it yourself"
+    if [ -z "$fence_present" ] && tomb_read && [ "$T_CONTAINER" = "$CTR_ID" ] && [ "$CTR_STATUS" = exited ] && [ "$CTR_EXIT" = 0 ]; then
+      # A previous launcher recorded the clean release but died before `rm`.
+      msg "finishing the recorded clean release of container $CTR_ID"
+      eng rm "$CONTAINER_NAME" >/dev/null || die $EX_FAILURE "cannot remove the released container $CONTAINER_NAME; retry"
+    else
+    [ -n "$fence_present" ] || die $EX_REFUSED "managed container $CONTAINER_NAME exists (workspace '$CTR_WS') but the host fence $FENCE is missing; not removing anything. Recover from that workspace or inspect the container by hand"
+    [ "$CTR_WS" = "$F_WS" ] && [ "$CTR_IMGREF" = "$F_IMAGE" ] && [ "$CTR_CLAIM" = "$F_TOKEN" ] && [ "$CTR_IMAGE" = "$F_IMAGE_ID" ] || die $EX_REFUSED "container $CONTAINER_NAME (workspace '$CTR_WS', image '$CTR_IMGREF', claim '$CTR_CLAIM', image id '$CTR_IMAGE') does not match the fence (workspace '$F_WS', image '$F_IMAGE', claim '$F_TOKEN', image id '$F_IMAGE_ID'); refusing to touch either"
+    [ "$F_ENGINE" = "$ENGINE_KIND" ] || die $EX_REFUSED "workspace '$F_WS' was started with $F_ENGINE; use that engine"
+    case "$CTR_STATUS" in
+      running)
+        [ "$F_WS" = "$WS" ] || { msg "another workspace is active in the managed container: $F_WS"; msg "finish or /quit there and let it stop, then start from this directory"; recovery_hint "$F_WS"; die $EX_REFUSED "refusing to change mounts, data, or running work"; }
+        [ "$IMAGE" = "$F_IMAGE" ] || msg "note: image '$IMAGE' requested, keeping the recorded '$F_IMAGE' (version $F_IMAGE_VERSION) until this workspace stops cleanly"
+        [ "$ENV_FILE" = "$F_ENV_FILE" ] || msg "note: env-file changes apply only when the container is recreated after a clean stop"
+        [ "$TZ_SEL" = "$F_TZ" ] || msg "note: timezone '$TZ_SEL' requested, container keeps '$F_TZ' until recreated"
+        return 0 ;;
+      exited)
+        if [ "$CTR_EXIT" = 0 ]; then
+          msg "previous workspace '$F_WS' finished cleanly (exit 0); releasing it"
+          tomb_write_from_fence
+          eng rm "$CONTAINER_NAME" >/dev/null || die $EX_FAILURE "cannot remove the finished container $CONTAINER_NAME (the release is recorded in $TOMB; retry)"
+          fence_present=
+          # fall through to the no-container path with a tombstone
+        else
+          [ "$F_WS" = "$WS" ] || { msg "the managed container stopped uncleanly (exit $CTR_EXIT) for workspace '$F_WS' and must be recovered from that directory"; recovery_hint "$F_WS"; die $EX_REFUSED "refusing to start another workspace over unclean state"; }
+          [ "$IMAGE" = "$F_IMAGE" ] || msg "note: recovering with the recorded image '$F_IMAGE' (id ${F_IMAGE_ID}); '$IMAGE' applies after a clean stop"
+          msg "restarting the stopped container for this workspace (previous exit $CTR_EXIT)"
+          eng start "$CONTAINER_NAME" >/dev/null || die $EX_FAILURE "cannot start container $CONTAINER_NAME"
+          return 0
+        fi ;;
+      created)
+        if ctr_never_started && [ "$F_WS" = "$WS" ] && { data_empty || { tomb_read && [ "$T_TOKEN" = "$F_RELEASE" ]; }; }; then
+          msg "removing a container that never started (previous launcher failed before start)"
+          eng rm "$CONTAINER_NAME" >/dev/null || die $EX_FAILURE "cannot remove the never-started container"
+          CLAIM_TOKEN=$F_TOKEN; fence_rollback; CLAIM_TOKEN=
+          fence_present=
+        else
+          [ "$F_WS" = "$WS" ] || { recovery_hint "$F_WS"; die $EX_REFUSED "a created-but-unproven container belongs to workspace '$F_WS'"; }
+          msg "starting the previously created container"
+          eng start "$CONTAINER_NAME" >/dev/null || die $EX_FAILURE "cannot start container $CONTAINER_NAME"
+          return 0
+        fi ;;
+      *)
+        [ "$F_WS" = "$WS" ] || { recovery_hint "$F_WS"; die $EX_REFUSED "container is in state '$CTR_STATUS' for workspace '$F_WS'"; }
+        msg "container is in state '$CTR_STATUS'; trying to start it"
+        eng start "$CONTAINER_NAME" >/dev/null || die $EX_FAILURE "cannot start container $CONTAINER_NAME (state $CTR_STATUS)"
+        return 0 ;;
+    esac
+    fi
+  fi
+
+  # No owned container now.
+  if [ -n "$fence_present" ]; then
+    # Unclean recovery: the container was removed externally; recreate it from the record.
+    [ "$F_WS" = "$WS" ] || { recovery_hint "$F_WS"; die $EX_REFUSED "workspace '$F_WS' still holds the fence (its container is gone, its state was not released cleanly); recover from that directory"; }
+    [ "$F_ENGINE" = "$ENGINE_KIND" ] || die $EX_REFUSED "workspace '$F_WS' was started with $F_ENGINE; use that engine"
+    if [ -n "$F_ENV_FILE" ]; then
+      [ -f "$F_ENV_FILE" ] && [ -r "$F_ENV_FILE" ] || die $EX_REFUSED "recovery needs the recorded env-file $F_ENV_FILE, which is missing"
+      ck=$(cksum <"$F_ENV_FILE" | cut -d' ' -f1,2)
+      [ "$ck" = "$F_ENV_CKSUM" ] || die $EX_REFUSED "the recorded env-file $F_ENV_FILE changed since the container was created (cksum $ck, recorded $F_ENV_CKSUM); restore it or reset the workspace deliberately"
+      [ "$ENV_FILE" = "$F_ENV_FILE" ] || msg "note: recovering with the recorded env-file $F_ENV_FILE"
+    else
+      [ -z "$ENV_FILE" ] || msg "note: the workspace was created without an env-file; PRIME_AGENT_ENV_FILE applies after a clean stop"
+    fi
+    if ! img_inspect "$F_IMAGE_ID"; then
+      [ -n "$F_IMAGE_DIGEST" ] || die $EX_REFUSED "the recorded image id $F_IMAGE_ID (version $F_IMAGE_VERSION, '$F_IMAGE') is no longer available locally and no immutable digest was recorded; restore that image or reset the workspace deliberately"
+      msg "recorded image is gone locally; pulling its immutable digest $F_IMAGE_DIGEST"
+      eng pull "$F_IMAGE_DIGEST" >&2 || die $EX_FAILURE "cannot pull $F_IMAGE_DIGEST"
+      img_inspect "$F_IMAGE_ID" || die $EX_REFUSED "pulled $F_IMAGE_DIGEST but it does not restore image id $F_IMAGE_ID"
+    fi
+    require_image_identity "$F_IMAGE_ID"
+    [ "$IMG_VERSION" = "$F_IMAGE_VERSION" ] || die $EX_REFUSED "image $F_IMAGE_ID reports version '$IMG_VERSION', recorded '$F_IMAGE_VERSION'"
+    msg "recreating the removed container for this workspace from the recorded settings (image $F_IMAGE_VERSION, tz $F_TZ, oauth $F_OAUTH)"
+    engine_create "$F_IMAGE_ID" "$F_TZ" "$F_OAUTH" "$F_ENV_FILE" "$F_TOKEN" "$F_IMAGE" || die $EX_FAILURE "engine run failed during recovery; the fence is retained"
+    return 0
+  fi
+
+  # No fence: a fresh claim. Only an empty /data or a matching clean-release tombstone allows it.
+  release=
+  if tomb_read; then
+    release=$T_TOKEN
+  elif ! data_empty; then
+    die $EX_REFUSED "$DATA is not empty but no workspace fence exists. Its sessions may carry schedules or recovery state from an unknown project; back it up and move it away deliberately, or restore the fence, before starting here"
+  fi
+  if ! img_inspect "$IMAGE"; then
+    msg "pulling $IMAGE"
+    eng pull "$IMAGE" >&2 || die $EX_UNAVAILABLE "cannot pull $IMAGE"
+    img_inspect "$IMAGE" || die $EX_UNAVAILABLE "pulled $IMAGE but it is still not inspectable"
+  fi
+  require_image_identity "$IMAGE"
+  fence_write_new "$release"
+  if ! engine_create "$IMG_ID" "$TZ_SEL" "$OAUTH" "$ENV_FILE" "$CLAIM_TOKEN" "$IMAGE"; then
+    msg "engine run failed"
+    if ctr_inspect; then
+      if [ "$CTR_CLAIM" = "$CLAIM_TOKEN" ] && ctr_never_started && [ "$CTR_STATUS" = created ]; then
+        eng rm "$CONTAINER_NAME" >/dev/null 2>&1 && msg "removed the never-started container"
+        fence_rollback
+      else
+        msg "a container exists in state '$CTR_STATUS'; keeping the fence for recovery"
+      fi
+    else
+      fence_rollback
+    fi
+    msg "hint: if a callback port is busy, retry with PRIME_AGENT_NO_OAUTH_PORTS=1"
+    die $EX_FAILURE "container was not started"
+  fi
+  return 0
+}
+
+wait_for_service() {
+  wait_ready; r=$?
+  case $r in
+    0) ;;
+    1) show_container_diagnostics
+       if ctr_inspect && [ -n "${CLAIM_TOKEN:-}" ] && [ "$CTR_CLAIM" = "$CLAIM_TOKEN" ] && [ "$CTR_STATUS" = created ] && ctr_never_started; then
+         eng rm "$CONTAINER_NAME" >/dev/null 2>&1; fence_rollback
+         die $EX_FAILURE "the container never started; claim rolled back"
+       fi
+       die $EX_FAILURE "the container service stopped before becoming ready; state retained for recovery" ;;
+    2) show_container_diagnostics; die $EX_FAILURE "the container service did not become ready within ${READY_TIMEOUT}s; state retained" ;;
+  esac
+  # Started: the tombstone this fence consumed (recorded as release-token) can go
+  # now, whichever launcher wrote the fence.
+  rel=$(read1 "$FENCE/release-token" 2>/dev/null) || rel=
+  if [ -n "$rel" ] && tomb_read && [ "$T_TOKEN" = "$rel" ]; then
+    mv -- "$TOMB" "$TOMB.done.$$" 2>/dev/null && rm -rf -- "$TOMB.done.$$"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 10. client exec
+# ---------------------------------------------------------------------------
+# When the terminal disappears (tab closed, ssh dropped) the engine's exec
+# client dies or hangs, but the TUI process inside the container keeps its pty
+# and its client lease and would arm the container forever. Each client
+# therefore carries a token; on HUP/INT/TERM the launcher hangs up exactly that
+# process inside the container and then its own engine client. The client runs
+# as a background job so `wait` is interruptible by the trap (a foreground
+# child would defer the trap until the client exits, which never happens).
+CLIENT_TOKEN=; SIGNALED=
+client_hangup() {
+  [ -n "$CLIENT_TOKEN" ] || return 0
+  dbg "client_hangup token=$CLIENT_TOKEN"
+  eng exec "$CONTAINER_NAME" sh -c 'd=/run/prime-agent-container/clients; for l in "$d"/*; do
+      [ "$(cat "$l/token" 2>/dev/null)" = "$1" ] || continue
+      p=${l##*/}; kill -HUP "$p" 2>/dev/null || continue
+      i=0; while [ $i -lt 10 ] && kill -0 "$p" 2>/dev/null; do sleep 1; i=$((i+1)); done
+      kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null
+    done; exit 0' sh "$CLIENT_TOKEN" >/dev/null 2>&1 </dev/null
+  dbg "client_hangup done rc=$?"
+}
+run_client() { # "$@" = user args; returns the client status
+  set -- "$@"
+  ttyflags=-i
+  if is_tty 0 && is_tty 1; then ttyflags=-it; fi
+  # TERM/COLORTERM are forwarded per exec (single-line values only).
+  t=${TERM:-}; c=${COLORTERM:-}
+  if [ -n "$t" ] && ! has_nl "$t"; then set -- -e "TERM=$t" "$@"; fi
+  if [ -n "$c" ] && ! has_nl "$c"; then set -- -e "COLORTERM=$c" "$@"; fi
+  CLIENT_TOKEN=$(random_token); SIGNALED=
+  trap 'SIGNALED=1; dbg "trap HUP"' HUP; trap 'SIGNALED=2; dbg "trap INT"' INT; trap 'SIGNALED=15; dbg "trap TERM"' TERM
+  # A background job would get /dev/null as stdin; hand it the real stdin via fd 3.
+  exec 3<&0
+  eng exec "$ttyflags" -w /work -e PRIME_AGENT_CONTAINER_CLIENT=1 -e "PRIME_AGENT_CONTAINER_CLIENT_TOKEN=$CLIENT_TOKEN" "$@" <&3 &
+  cpid=$!
+  dbg "client started cpid=$cpid ttyflags=$ttyflags"
+  wait "$cpid"; st=$?
+  dbg "wait returned st=$st signaled=$SIGNALED"
+  if [ -n "$SIGNALED" ]; then
+    client_hangup
+    kill -TERM "$cpid" 2>/dev/null
+    i=0; while [ $i -lt 5 ] && kill -0 "$cpid" 2>/dev/null; do sleep 1; i=$((i+1)); done
+    kill -KILL "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+    st=$((128 + SIGNALED))
+  fi
+  exec 3<&-
+  trap - HUP INT TERM; CLIENT_TOKEN=
+  return $st
+}
+
+main() {
+  ensure_container
+  wait_for_service
+  release_lock
+  # Insert the container name and wrapper before the user arguments.
+  set -- "$CONTAINER_NAME" /usr/local/bin/prime-agent "$@"
+  run_client "$@"; st=$?
+  if [ $st -eq 200 ]; then
+    # Stopping gate seen before Prime Agent started: retry exactly once.
+    msg "the service was stopping; waiting for it to settle"
+    waited=0
+    while [ "$waited" -lt "$GATE_WAIT" ]; do
+      if ! ctr_inspect || [ "$CTR_STATUS" != running ]; then
+        acquire_lock; ensure_container; wait_for_service; release_lock
+        run_client "$@"; st=$?; break
+      fi
+      if ! eng exec "$CONTAINER_NAME" test -e "$RUN_DIR/stopping" >/dev/null 2>&1; then
+        run_client "$@"; st=$?; break
+      fi
+      sleep 1; waited=$((waited+1))
+    done
+    [ $st -ne 200 ] || die $EX_TEMPFAIL "the service is still stopping; retry in a moment"
+  fi
+  if [ -n "$SIGNALED" ]; then trap - HUP INT TERM; kill -"$SIGNALED" $$; fi
+  exit $st
+}
+main "$@"

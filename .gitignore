@@ -1,1 +1,21 @@
+# Private working material — never published with the repository.
 temp/
+PLAN.md
+TODO.md
+CLAUDE.md
+.claude/
+# Local runs, credentials, archives, caches.
+*.log
+*.raw
+*.tar
+*.env
+.env*
+.faux/
+node_modules/
+__pycache__/
+scratch*/
+out-*/
+# Editor and OS files.
+*.swp
+*~
+.DS_Store

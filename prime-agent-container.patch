@@ -1,0 +1,151 @@
+diff -Naur a/packages/coding-agent/docs/settings.md b/packages/coding-agent/docs/settings.md
+--- a/packages/coding-agent/docs/settings.md
++++ b/packages/coding-agent/docs/settings.md
+@@ -200,7 +200,7 @@
+ 
+ | Setting | Type | Default | Description |
+ |---------|------|---------|-------------|
+-| `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
++| `idleEvictionMinutes` | number or `"off"` | `0.1` (container build; upstream `90`) | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
+ 
+ `idleEvictionMinutes` is a global daemon policy and is read only from `~/.prime/agent/settings.json`. Set it to a positive number to configure the idle threshold.
+ 
+diff -Naur a/packages/coding-agent/src/cli/container-config.ts b/packages/coding-agent/src/cli/container-config.ts
+--- a/packages/coding-agent/src/cli/container-config.ts
++++ b/packages/coding-agent/src/cli/container-config.ts
+@@ -0,0 +1,67 @@
++import { statSync } from "node:fs";
++import { isAbsolute, join } from "node:path";
++
++/**
++ * Container build: managed instructions and skills.
++ *
++ * A container image sets PRIME_AGENT_CONTAINER_CONFIG_DIR to a read-only
++ * directory outside the persistent agent state. Its `APPEND_SYSTEM.md` and
++ * `skills/` entries are prepended to the runtime config that every client
++ * derives from its CLI arguments, so they reach initial sessions, daemon
++ * defaults, worker creation/recovery, and subagents without touching public
++ * management commands. Managed entries come first; user entries keep the last
++ * word. When the variable is unset or relative, or an entry is missing or of
++ * the wrong type, the inputs are returned untouched and behavior is exactly
++ * upstream's.
++ */
++export const CONTAINER_CONFIG_DIR_ENV = "PRIME_AGENT_CONTAINER_CONFIG_DIR";
++export const CONTAINER_APPEND_SYSTEM_PROMPT_FILE = "APPEND_SYSTEM.md";
++export const CONTAINER_SKILLS_DIR = "skills";
++
++export function containerConfigDir(environment: NodeJS.ProcessEnv = process.env): string | undefined {
++	const value = environment[CONTAINER_CONFIG_DIR_ENV];
++	if (!value || !isAbsolute(value) || value.includes("\n")) {
++		return undefined;
++	}
++	return value;
++}
++
++function withContainerEntry(
++	values: string[] | undefined,
++	entryName: string,
++	kind: "file" | "directory",
++	environment: NodeJS.ProcessEnv,
++): string[] | undefined {
++	const dir = containerConfigDir(environment);
++	if (dir === undefined) {
++		return values;
++	}
++	const entry = join(dir, entryName);
++	let present: boolean;
++	try {
++		const stats = statSync(entry);
++		present = kind === "file" ? stats.isFile() : stats.isDirectory();
++	} catch {
++		present = false;
++	}
++	if (!present) {
++		return values;
++	}
++	return [entry, ...(values ?? []).filter((value) => value !== entry)];
++}
++
++/** Prepend the managed `APPEND_SYSTEM.md`, when present, to `--append-system-prompt` inputs. */
++export function withContainerAppendSystemPrompt(
++	appendSystemPrompt: string[] | undefined,
++	environment: NodeJS.ProcessEnv = process.env,
++): string[] | undefined {
++	return withContainerEntry(appendSystemPrompt, CONTAINER_APPEND_SYSTEM_PROMPT_FILE, "file", environment);
++}
++
++/** Prepend the managed `skills/` directory, when present, to explicit `--skill` inputs. */
++export function withContainerSkills(
++	skills: string[] | undefined,
++	environment: NodeJS.ProcessEnv = process.env,
++): string[] | undefined {
++	return withContainerEntry(skills, CONTAINER_SKILLS_DIR, "directory", environment);
++}
+diff -Naur a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
+--- a/packages/coding-agent/src/core/settings-manager.ts
++++ b/packages/coding-agent/src/core/settings-manager.ts
+@@ -6,7 +6,10 @@
+ import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+ 
+ const RECENT_MODELS_LIMIT = 20;
+-export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
++// Container build: upstream defaults to 90. The short default lets the daemon's own
++// non-archiving idle passivation run on its 60-second minimum sweep so an idle
++// service container can stop; an explicit `idleEvictionMinutes` setting still wins.
++export const DEFAULT_IDLE_EVICTION_MINUTES = 0.1;
+ 
+ export interface CompactionSettings {
+ 	enabled?: boolean; // default: true
+@@ -137,7 +140,7 @@
+ 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+ 	defaultServiceTier?: ServiceTier;
+ 	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 2
+-	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 90
++	idleEvictionMinutes?: number | "off"; // global daemon policy; default: 0.1 in the container build (upstream: 90)
+ 	transport?: TransportSetting; // default: "auto"
+ 	steeringMode?: "all" | "one-at-a-time";
+ 	followUpMode?: "all" | "one-at-a-time";
+diff -Naur a/packages/coding-agent/src/main.ts b/packages/coding-agent/src/main.ts
+--- a/packages/coding-agent/src/main.ts
++++ b/packages/coding-agent/src/main.ts
+@@ -13,6 +13,7 @@
+ import chalk from "chalk";
+ import { type Args, type Mode, parseArgs } from "./cli/args.js";
+ import { formatTopLevelHelp } from "./cli/command-registry.js";
++import { withContainerAppendSystemPrompt, withContainerSkills } from "./cli/container-config.js";
+ import {
+ 	ensureInteractiveDaemonRunning,
+ 	isDaemonSessionSummary,
+@@ -651,7 +652,7 @@
+ 		model: parsed.model,
+ 		apiKey: parsed.apiKey,
+ 		systemPrompt: parsed.systemPrompt,
+-		appendSystemPrompt: parsed.appendSystemPrompt,
++		appendSystemPrompt: withContainerAppendSystemPrompt(parsed.appendSystemPrompt),
+ 		thinking: parsed.thinking,
+ 		models: parsed.models,
+ 		tools: parsed.tools,
+@@ -659,7 +660,7 @@
+ 		noBuiltinTools: parsed.noBuiltinTools,
+ 		extensions: resolveCliPaths(cwd, parsed.extensions),
+ 		noExtensions: parsed.noExtensions,
+-		skills: resolveCliPaths(cwd, parsed.skills),
++		skills: withContainerSkills(resolveCliPaths(cwd, parsed.skills)),
+ 		noSkills: parsed.noSkills,
+ 		promptTemplates: resolveCliPaths(cwd, parsed.promptTemplates),
+ 		noPromptTemplates: parsed.noPromptTemplates,
+diff -Naur a/packages/coding-agent/test/settings-manager.test.ts b/packages/coding-agent/test/settings-manager.test.ts
+--- a/packages/coding-agent/test/settings-manager.test.ts
++++ b/packages/coding-agent/test/settings-manager.test.ts
+@@ -493,9 +493,9 @@
+ 		});
+ 	});
+ 	describe("idle worker eviction", () => {
+-		it("defaults to 90 minutes and treats none as off", () => {
++		it("defaults to the container build's 0.1 minutes and treats none as off", () => {
+ 			const manager = SettingsManager.create(projectDir, agentDir);
+-			expect(manager.getIdleEvictionMinutes()).toBe(90);
++			expect(manager.getIdleEvictionMinutes()).toBe(0.1);
+ 
+ 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ idleEvictionMinutes: "none" }));
+ 			const disabled = SettingsManager.create(projectDir, agentDir);

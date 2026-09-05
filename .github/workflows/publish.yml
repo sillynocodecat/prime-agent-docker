@@ -1,0 +1,207 @@
+name: Build and publish
+
+# Triggers:
+#   push to main    — always builds (documentation-only changes are excluded below)
+#   daily schedule  — release check: builds only when GitHub's latest published
+#                     Prime Agent release differs from the last published one
+#   weekly schedule — security rebuild: always rebuilds so refreshed Node/Debian
+#                     base layers publish even for an unchanged Prime Agent tag
+#   manual dispatch — always builds
+# The image is amd64 only, built on a native runner, verified during the build
+# (smoke, kernel, lifecycle JSON contract) and by the launcher tests before it
+# is published as `latest` and the upstream tag.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'examples/**'
+      - '.gitignore'
+  schedule:
+    - cron: '17 5 * * *'   # daily release check
+    - cron: '41 6 * * 1'   # weekly forced security rebuild (Monday)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: PrimeIntellect-ai/prime-agent
+
+jobs:
+  metadata:
+    name: Resolve upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      version: ${{ steps.upstream.outputs.version }}
+      revision: ${{ steps.upstream.outputs.revision }}
+      image_name: ${{ steps.image.outputs.image_name }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+      cache_hit: ${{ steps.restore.outputs.cache-hit }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Resolve the latest published release (plain vX.Y.Z, not draft/prerelease/beta)
+        id: upstream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: sh build/ci/resolve-upstream.sh
+
+      - name: Restore the last published upstream tag
+        id: restore
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/upstream-tag
+          key: upstream-tag-${{ steps.upstream.outputs.tag }}
+          restore-keys: |
+            upstream-tag-
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -eu
+          prev=""
+          [ ! -f "${RUNNER_TEMP}/upstream-tag/tag" ] || prev="$(cat "${RUNNER_TEMP}/upstream-tag/tag")"
+          if [ "$EVENT" = schedule ] && [ "$SCHEDULE" = '17 5 * * *' ] && [ -n "$prev" ] && [ "$prev" = "$TAG" ]; then
+            echo "daily check: $TAG already published, skipping"; echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "building $TAG (event=$EVENT schedule='$SCHEDULE' previous='$prev')"; echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Image name (lowercase GHCR repository)
+        id: image
+        run: |
+          set -eu
+          repo="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "image_name=ghcr.io/${repo}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and verify (amd64)
+    needs: metadata
+    if: needs.metadata.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Host facts
+        run: |
+          set -eu
+          podman --version; dpkg --print-architecture; python3 --version
+          [ "$(dpkg --print-architecture)" = amd64 ]
+
+      - name: Pull fresh base manifests (never trust a stale FROM cache)
+        run: |
+          set -eu
+          podman pull docker.io/library/node:22-trixie-slim
+          podman pull ghcr.io/astral-sh/uv:0.12.9
+
+      - name: Build the image (the verify stage runs smoke, kernel and lifecycle JSON checks)
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          REVISION: ${{ needs.metadata.outputs.revision }}
+          IMAGE: ${{ needs.metadata.outputs.image_name }}
+        run: |
+          set -eu
+          podman build --pull=always --platform linux/amd64 \
+            --build-arg "PRIME_AGENT_VERSION=${VERSION}" \
+            --build-arg "PRIME_AGENT_REVISION=${REVISION}" \
+            --build-arg "IMAGE_SOURCE=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -t "${IMAGE}:ci" .
+          podman image inspect --format '{{.Architecture}}/{{.Os}} {{index .Config.Labels "org.opencontainers.image.version"}} {{index .Config.Labels "io.github.sillynocodecat.prime-agent-docker.runtime-schema"}}' "${IMAGE}:ci"
+          [ "$(podman image inspect --format '{{.Architecture}}' "${IMAGE}:ci")" = amd64 ]
+          [ "$(podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "${IMAGE}:ci")" = "${VERSION}" ]
+          cat /dev/null; podman run --rm --entrypoint cat "${IMAGE}:ci" /usr/share/doc/prime-agent-docker/build-report.txt | tail -n 8
+
+      - name: Launcher self-test (fake engine, POSIX sh and dash)
+        run: |
+          set -eu
+          sh build/tests/launcher-self-test.sh
+          dash build/tests/launcher-self-test.sh
+
+      - name: Launcher end-to-end against the built image (Podman)
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image_name }}
+        run: ENGINE=podman IMAGE="${IMAGE}:ci" OUT="${RUNNER_TEMP}/launcher-e2e" bash build/tests/launcher-e2e.sh
+
+      - name: Lifecycle with real sessions (faux provider, no credentials)
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image_name }}
+        run: ENGINE=podman IMG="${IMAGE}:ci" OUT="${RUNNER_TEMP}/lifecycle" bash build/ci/lifecycle/run-lifecycle.sh G R J
+
+      - name: Save the OCI archive
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image_name }}
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/out"
+          podman save --format oci-archive -o "${RUNNER_TEMP}/out/prime-agent-docker-amd64.tar" "${IMAGE}:ci"
+
+      - name: Upload the OCI archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: image-amd64
+          path: ${{ runner.temp }}/out/prime-agent-docker-amd64.tar
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Publish to GHCR
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download the OCI archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: image-amd64
+          path: ${{ runner.temp }}/in
+
+      - name: Load the image
+        run: podman load -i "${RUNNER_TEMP}/in/prime-agent-docker-amd64.tar"
+
+      - name: Log in to GHCR (publish job only)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Push latest and the upstream tag (single platform, amd64)
+        env:
+          IMAGE: ${{ needs.metadata.outputs.image_name }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -eu
+          podman tag "${IMAGE}:ci" "${IMAGE}:latest"
+          podman tag "${IMAGE}:ci" "${IMAGE}:${TAG}"
+          podman push "${IMAGE}:${TAG}"
+          podman push "${IMAGE}:latest"
+          podman logout ghcr.io
+
+  save-cache:
+    name: Remember the published upstream tag
+    needs: [metadata, publish]
+    if: ${{ needs.publish.result == 'success' && needs.metadata.outputs.cache_hit != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write the tag
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/upstream-tag"
+          printf '%s\n' "$TAG" > "${RUNNER_TEMP}/upstream-tag/tag"
+
+      - name: Save the cache (only after every tag was published)
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/upstream-tag
+          key: upstream-tag-${{ needs.metadata.outputs.tag }}
