@@ -52,8 +52,13 @@ check '[ "$(ins "{{.HostConfig.RestartPolicy.Name}}")" = no ]' "restart policy n
 check 'ins "{{.HostConfig.SecurityOpt}}" | grep -q no-new-privileges' "no-new-privileges: $(ins '{{.HostConfig.SecurityOpt}}')"
 check 'ins "{{.HostConfig.Init}}{{.HostConfig.Tmpfs}}" | grep -q "prime-agent-container"' "init + tmpfs: $(ins '{{.HostConfig.Init}} {{.HostConfig.Tmpfs}}')"
 # Docker reports the :Z option in Binds; Podman rewrites it, so the relabel itself is the proof there.
-check 'ins "{{.HostConfig.Binds}}" | grep -q ":/work:Z" || ls -dZ "$OUT/ws1" | grep -q container_file_t' "private :Z relabel on /work (binds: $(ins '{{.HostConfig.Binds}}' | tr -d '\n' | cut -c1-80)…)"
-check 'ins "{{.HostConfig.Binds}}" | grep -q ":/data:Z" || ls -dZ "$H/prime-agent/data" | grep -q container_file_t' "private :Z relabel on /data"
+# Without SELinux (GitHub runners) neither is observable; the exact `-v …:Z` argv is proven by the self-test.
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != Disabled ]; then
+  check 'ins "{{.HostConfig.Binds}}" | grep -q ":/work:Z" || ls -dZ "$OUT/ws1" | grep -q container_file_t' "private :Z relabel on /work (binds: $(ins '{{.HostConfig.Binds}}' | tr -d '\n' | cut -c1-80)…)"
+  check 'ins "{{.HostConfig.Binds}}" | grep -q ":/data:Z" || ls -dZ "$H/prime-agent/data" | grep -q container_file_t' "private :Z relabel on /data"
+else
+  ok "SELinux not active on this host; :Z relabel not observable (argv proven by the self-test)"
+fi
 check 'ins "{{.HostConfig.PortBindings}}" | grep -q 127.0.0.1' "OAuth ports bound to loopback"
 check 'ins "{{range .Config.Env}}{{.}}{{\"\\n\"}}{{end}}" | grep -q "^TZ=$(fence tz)$"' "container TZ env = fence tz"
 check 'ins "{{range .Config.Env}}{{.}}{{\"\\n\"}}{{end}}" | grep -q "^PRIME_AGENT_CONTAINER_CLIENT=$"' "empty client marker pinned"
